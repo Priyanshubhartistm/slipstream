@@ -3,13 +3,9 @@
   <img src="frontend/assets/banner-slipstream.png" alt="Slipstream" width="620" height="300" />
 </p>
 
-<p align="center">
-  <a href="https://slipstream.ansht.tech"><strong>🌐 Live demo</strong></a> &nbsp;·&nbsp;
-  <a href="https://slipstream.ansht.tech/docs">📚 Docs</a>
-</p>
+
 
 <p align="center">
-  <a href="https://github.com/Ansh-699/SlipStream/actions/workflows/ci.yml"><img src="https://github.com/Ansh-699/SlipStream/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT" />
   <img src="https://img.shields.io/badge/Solana-devnet-14F195.svg" alt="Solana devnet" />
 </p>
