@@ -1,0 +1,634 @@
+import { Connection, PublicKey, Transaction, LAMPORTS_PER_SOL } from "@solana/web3.js";
+import {
+  getBaseConnection,
+  getErConnection,
+  loadKeypair,
+  sendAndConfirm,
+  sleep,
+  log,
+} from "./shared/connection";
+import { getKeeperAddresses } from "./shared/manifest";
+import { sendErTx, classifyTxError, errText } from "./shared/ertx";
+import { recordSettledFills } from "./shared/fill-db";
+import { beat } from "./shared/heartbeat";
+import {
+  createInitializeFillLogInstruction,
+  createDelegateFillLogInstruction,
+  createMirrorFillsInstruction,
+  createCommitFillLogInstruction,
+  createSettleFromLogInstruction,
+  createRecordPendingFillInstruction,
+  MAX_SETTLE_REMAINING_ACCOUNTS,
+} from "../../client/src/instructions";
+import { findFillLogPda, findUserAccountPda, findPositionPda } from "../../client/src/pda";
+import { DELEGATION_PROGRAM_ID } from "../../client/src/constants";
+import { decodeFillLogHeader, decodeFillLogFills } from "../../client/src/accounts";
+
+/**
+ * fill-log settlement keeper — the settlement pipeline that actually lands ER
+ * fills as L1 Positions, WITHOUT ever committing the 612 KB OrderBook.
+ *
+ * Pipeline each tick:
+ *   1. mirror_fills  (ER): copy new OrderBook fills into the small FillLog.
+ *   2. commit_fill_log (ER): flush the FillLog to L1 (each commit consumes 1 of
+ *      the account's 10 sponsored commits — proven empirically).
+ *   3. settle_from_log (L1): read the committed FillLog and write Positions.
+ *
+ * EPOCH ROTATION: the sponsored-commit cap is a hard 10 PER delegated account
+ * (verified live on two fresh accounts). When the current FillLog nears 10
+ * commits, the keeper initializes + delegates the NEXT epoch's FillLog (a fresh
+ * PDA with its own fresh 10) and rolls over. Settlement is therefore continuous;
+ * old epoch logs are drained then abandoned (each ~8 KB, trivial devnet rent).
+ */
+
+const MARKET_INDEX = 0;
+const MAX_FILLS_PER_TX = 8;
+const POLL_INTERVAL_MS = 4000;
+const COMMIT_POLL_TRIES = 15;
+const COMMIT_POLL_INTERVAL_MS = 1500;
+// Rotate BEFORE the hard cap of 10 so a commit never fails mid-flight.
+const COMMITS_BEFORE_ROTATE = 9;
+const ERR_FILL_QUEUE_EMPTY = 0x11d;
+const ERR_FILL_QUEUE_FULL = 0x11e;
+// Bound each mirror_fills call: max_fills=0 (uncapped) scans+copies the whole
+// 4096-slot fill ring and blows the CU budget once a backlog builds (observed
+// live: "exceeded CUs meter", settlement stalled for days). The on-chain
+// FillLog ring holds FILL_LOG_CAPACITY=80 and now refuses (FillQueueFull)
+// rather than overwriting once full, so this is a throughput knob, not a
+// safety one — kept at FILL_LOG_CAPACITY/2 - MAX_FILLS_PER_TX so two
+// consecutive mirrors without an intervening settle still leave headroom.
+const MAX_FILLS_PER_MIRROR = 32;
+// Ring scan + appends need more than the 200k default; the ER honors
+// ComputeBudget (verified live: bounded mirror consumed 83k with headroom).
+const MIRROR_CU_LIMIT = 600_000;
+// Consecutive mirror failures before assuming the current epoch is unusable
+// (full log + spent commit budget) and rotating to a fresh one.
+const MIRROR_ERRORS_BEFORE_ROTATE = 3;
+
+// Market::_padding2[0..4] holds the L1 settlement cursor (little-endian u32);
+// see programs/slipstream/src/state/market.rs last_settled_sequence().
+const MARKET_CURSOR_OFFSET = 2058;
+
+/**
+ * ROTATION BRAKES.
+ *
+ * Rotating buys a fresh 10-commit budget; it costs one rent-exempt ~8 KB
+ * FillLog that is never reclaimed. That trade is only worth making while
+ * settlement is actually ADVANCING. It stopped advancing at sequence 49,784 and
+ * the keeper kept paying: 461 FillLog accounts holding 27.18 SOL of stranded
+ * rent, burning ~1.849 SOL every 23 minutes, until an operator killed the
+ * process — which is why settlement has been down rather than merely slow.
+ *
+ * Three independent brakes, all enforced in rotate() because all three callers
+ * (commit budget edge, sponsored-commit-limit revert, repeated mirror failure)
+ * route through it:
+ *   (a) wedge   — the L1 cursor has not moved since the last rotation.
+ *   (b) rate    — at most MAX_ROTATIONS_PER_HOUR in any rolling hour.
+ *   (c) balance — never initialize a new epoch below MIN_INIT_BALANCE_SOL.
+ */
+const MAX_ROTATIONS_PER_HOUR = 3;
+const ROTATION_WINDOW_MS = 60 * 60_000;
+// Long enough that a wedged keeper costs nothing and quiet enough not to bury
+// the log, short enough that it recovers on its own the moment an operator
+// unblocks settlement.
+const ROTATE_REFUSED_SLEEP_MS = 5 * 60_000;
+const MIN_INIT_BALANCE_SOL = 0.5;
+const MIN_INIT_BALANCE_LAMPORTS = MIN_INIT_BALANCE_SOL * LAMPORTS_PER_SOL;
+
+/**
+ * settle_from_log consumes only the CONTIGUOUS run from cursor + 1 — it breaks
+ * at the first gap and writes the prefix maximum (R4's S4-01 fix) — so the
+ * window this keeper submits mirrors that rule by default.
+ *
+ * FILL_LOG_REQUIRE_CONTIGUOUS=0 submits ACROSS a gap instead (the pre-R4
+ * behaviour), for the case where an operator has established that a hole in the
+ * log is permanent and wants the fills behind it. Default is unchanged, so
+ * nothing switches mode without someone deciding to.
+ */
+const REQUIRE_CONTIGUOUS = process.env.FILL_LOG_REQUIRE_CONTIGUOUS !== "0";
+
+async function main() {
+  const base = getBaseConnection();
+  const er = getErConnection();
+  const keeper = loadKeypair();
+  const { programId, marketIndex, market } = getKeeperAddresses();
+
+  /** Read Market.last_settled_sequence from L1 (0 if the account is unreadable). */
+  async function readMarketCursor(): Promise<bigint> {
+    const info = await base.getAccountInfo(market);
+    if (!info || info.data.length < MARKET_CURSOR_OFFSET + 4) return 0n;
+    return BigInt(info.data.readUInt32LE(MARKET_CURSOR_OFFSET));
+  }
+
+  log("FILLLOG-KEEPER", `keeper ${keeper.publicKey.toBase58()} market=${marketIndex}`);
+
+  let epoch = parseInt(process.env.FILL_LOG_START_EPOCH ?? "0", 10);
+  let commitsThisEpoch = 0;
+  // L1 settlement cursor mirror (Market.last_settled_sequence is the source of truth).
+  let lastSettledSeq: bigint | null = null;
+  // Rotation brakes — see the ROTATION BRAKES note above.
+  const rotationsAt: number[] = [];
+  // The L1 cursor as of the last rotation, seeded from chain at boot. A rotation
+  // that fails to move it past this bought a rent-exempt account and nothing else.
+  let rotationBaselineCursor: bigint | null = null;
+
+  /**
+   * Discover the current live epoch: the highest epoch whose FillLog already
+   * exists. Rotation state is in-memory only, so a restart that blindly
+   * resumed at FILL_LOG_START_EPOCH landed on a long-abandoned epoch (full
+   * log, spent commit budget) and settlement deadlocked. Probes the ER, which
+   * knows every delegated FillLog, so discovery works even when the base RPC
+   * is rate-limited.
+   */
+  async function discoverEpoch(startEpoch: number): Promise<number> {
+    let ep = startEpoch;
+    for (;;) {
+      const [nextFl] = findFillLogPda(marketIndex, ep + 1, programId);
+      if (!(await er.getAccountInfo(nextFl))) return ep;
+      ep += 1;
+    }
+  }
+
+  /** Ensure the FillLog for `epoch` exists + is delegated to the ER. Idempotent. */
+  async function ensureEpochReady(ep: number): Promise<void> {
+    const [fillLog] = findFillLogPda(marketIndex, ep, programId);
+    const info = await base.getAccountInfo(fillLog);
+    if (!info) {
+      // (c) WALLET FLOOR. This is the ONLY place a FillLog is ever created, so
+      // guarding here covers boot and rotation alike. A keeper that has spent
+      // itself down to the rent for one more epoch cannot pay for the settles
+      // that epoch exists to enable.
+      const lamports = await base.getBalance(keeper.publicKey);
+      if (lamports < MIN_INIT_BALANCE_LAMPORTS) {
+        throw new Error(
+          `keeper wallet holds ${(lamports / LAMPORTS_PER_SOL).toFixed(4)} SOL, below the ` +
+            `${MIN_INIT_BALANCE_SOL} SOL floor — refusing to initialize FillLog epoch ${ep}`
+        );
+      }
+      const ix = createInitializeFillLogInstruction(keeper.publicKey, marketIndex, ep, programId);
+      const sig = await sendAndConfirm(base, new Transaction().add(ix), [keeper]);
+      log("FILLLOG-KEEPER", `epoch ${ep}: initialize_fill_log ${sig}`);
+    }
+    const after = await base.getAccountInfo(fillLog);
+    const delegated = after?.owner.toBase58() === DELEGATION_PROGRAM_ID.toBase58();
+    if (!delegated) {
+      const ix = createDelegateFillLogInstruction(keeper.publicKey, marketIndex, ep, programId);
+      const sig = await sendAndConfirm(base, new Transaction().add(ix), [keeper]);
+      log("FILLLOG-KEEPER", `epoch ${ep}: delegate_fill_log ${sig}`);
+      await sleep(3000);
+    }
+  }
+
+  /**
+   * (a) WEDGE DETECTION. `null` = rotating is worth the rent; a string = the
+   * reason it is not.
+   *
+   * A rotation is only ever justified by settlement having MOVED since the last
+   * one. When the L1 cursor is frozen, the fill at cursor + 1 is either missing
+   * from the committed FillLog or unsettleable from it (an orphaned
+   * UserAccount/Position, a permanent hole in the ring) — and a fresh epoch
+   * fixes neither. That is the exact state settlement is in now, and it is what
+   * turned 461 rotations into 27.18 SOL of stranded rent.
+   *
+   * Note this deliberately tests cursor PROGRESS rather than "is cursor + 1 in
+   * the committed L1 log". The latter alone is not a wedge signal: settle()
+   * drains the log completely every tick, so in NORMAL operation the committed
+   * copy never contains cursor + 1 — gating on that would refuse every healthy
+   * rotation too. The committed log is still read, but only to say WHICH kind of
+   * wedge this is in the log line an operator will act on.
+   */
+  async function rotateRefusalReason(): Promise<string | null> {
+    // (b) RATE CAP first: it is a pure in-memory check and needs no RPC.
+    // ponytail: in-memory, so a pm2 restart clears the hour. The wedge check
+    // below is seeded from chain at boot and is what actually holds across
+    // restarts; persist this to the heartbeat file only if a crash loop ever
+    // manages to out-rotate it.
+    const cutoff = Date.now() - ROTATION_WINDOW_MS;
+    while (rotationsAt.length > 0 && rotationsAt[0] < cutoff) rotationsAt.shift();
+    if (rotationsAt.length >= MAX_ROTATIONS_PER_HOUR) {
+      return `${rotationsAt.length} rotations in the last hour (cap ${MAX_ROTATIONS_PER_HOUR}) — each one strands rent`;
+    }
+
+    const cursor = await readMarketCursor();
+    if (rotationBaselineCursor !== null && cursor <= rotationBaselineCursor) {
+      const stuckAt = cursor + 1n;
+      let detail = "next fill not committed on L1";
+      try {
+        const [fillLog] = findFillLogPda(marketIndex, epoch, programId);
+        const l1 = await base.getAccountInfo(fillLog);
+        if (l1 && decodeFillLogFills(l1.data as Buffer).some((f) => f.sequence === stuckAt)) {
+          detail = "next fill IS committed but will not settle (orphaned UserAccount/Position?)";
+        }
+      } catch {
+        /* diagnostic only — never let it decide the refusal */
+      }
+      return `settlement wedged at seq ${stuckAt} — ${detail}; a fresh epoch cannot fix this`;
+    }
+    return null;
+  }
+
+  /** Rotate to the next epoch (fresh commit budget). False = refused/failed. */
+  async function rotate(): Promise<boolean> {
+    const refusal = await rotateRefusalReason();
+    if (refusal) {
+      log("FILLLOG-KEEPER", `NOT rotating epoch ${epoch}: ${refusal}`);
+      await sleep(ROTATE_REFUSED_SLEEP_MS);
+      return false;
+    }
+    const next = epoch + 1;
+    log("FILLLOG-KEEPER", `rotating epoch ${epoch} -> ${next} (commit budget exhausted)`);
+    try {
+      await ensureEpochReady(next);
+    } catch (e: any) {
+      // Includes the wallet floor. Back off rather than retrying every 4s: a
+      // low balance and a dead base RPC both need a human, not a tighter loop.
+      log("FILLLOG-KEEPER", `rotation to epoch ${next} failed: ${errText(e)}`);
+      await sleep(ROTATE_REFUSED_SLEEP_MS);
+      return false;
+    }
+    epoch = next;
+    commitsThisEpoch = 0;
+    rotationsAt.push(Date.now());
+    rotationBaselineCursor = await readMarketCursor();
+    return true;
+  }
+
+  /** mirror_fills on the ER: append new orderbook fills to the current FillLog. */
+  async function mirror(): Promise<"mirrored" | "empty" | "error"> {
+    try {
+      const ix = createMirrorFillsInstruction(
+        marketIndex,
+        epoch,
+        MAX_FILLS_PER_MIRROR,
+        programId
+      );
+      const sig = await sendErTx(er, ix, keeper, { computeUnits: MIRROR_CU_LIMIT });
+      log("FILLLOG-KEEPER", `epoch ${epoch}: mirror_fills ${sig}`);
+      return "mirrored";
+    } catch (e: any) {
+      const c = classifyTxError(e);
+      if (c.code === ERR_FILL_QUEUE_EMPTY) return "empty"; // nothing new
+      if (c.code === ERR_FILL_QUEUE_FULL) {
+        log("FILLLOG-KEEPER", `epoch ${epoch}: FillLog ring full; needs settle+rotate`);
+        return "error"; // reuses the same rotate-after-N-failures path below
+      }
+      log("FILLLOG-KEEPER", `mirror_fills error: ${c.name ?? c.raw}`);
+      return "error";
+    }
+  }
+
+  /** commit_fill_log on the ER; rotate first if at the budget edge. Returns the
+   *  ER FillLog header count we expect to see committed on L1. */
+  async function commit(): Promise<boolean> {
+    if (commitsThisEpoch >= COMMITS_BEFORE_ROTATE && !(await rotate())) {
+      // Refused. Committing anyway would just revert on the sponsored-commit
+      // cap and ask to rotate again.
+      return false;
+    }
+    const [fillLog] = findFillLogPda(marketIndex, epoch, programId);
+    const erInfo = await er.getAccountInfo(fillLog);
+    if (!erInfo) return false;
+    const erHeader = decodeFillLogHeader(erInfo.data as Buffer);
+    if (erHeader.count === 0) return false;
+
+    // Fast-forward guard: a fresh epoch's FillLog re-mirrors the ring from
+    // sequence 0, so right after a rotation everything mirrored may already be
+    // settled on L1. Committing those burns the epoch's 10-commit budget on
+    // no-op settles and forces an endless rotate loop. Keep mirroring (which
+    // advances last_mirrored_sequence) but skip the commit until the mirror
+    // passes the market's settlement cursor.
+    const cursor = await readMarketCursor();
+    if (erHeader.lastMirroredSequence <= cursor) return false;
+
+    try {
+      const ix = createCommitFillLogInstruction(keeper.publicKey, marketIndex, epoch, programId);
+      const sig = await sendErTx(er, ix, keeper);
+      commitsThisEpoch += 1;
+      log(
+        "FILLLOG-KEEPER",
+        `epoch ${epoch}: commit_fill_log #${commitsThisEpoch} ${sig} (count=${erHeader.count})`
+      );
+    } catch (e: any) {
+      const c = classifyTxError(e);
+      // Defensive: if we somehow hit the cap, rotate and retry next tick.
+      if (c.raw.includes("sponsored commit limit")) {
+        log("FILLLOG-KEEPER", `hit commit cap on epoch ${epoch}; rotating`);
+        await rotate();
+        return false;
+      }
+      log("FILLLOG-KEEPER", `commit_fill_log error: ${c.name ?? c.raw}`);
+      return false;
+    }
+
+    // Poll L1 until the committed FillLog reflects the ER count.
+    for (let i = 0; i < COMMIT_POLL_TRIES; i++) {
+      await sleep(COMMIT_POLL_INTERVAL_MS);
+      const l1 = await base.getAccountInfo(fillLog);
+      if (!l1) continue;
+      try {
+        const l1Header = decodeFillLogHeader(l1.data as Buffer);
+        if (l1Header.count >= erHeader.count) return true;
+      } catch {
+        /* not yet a valid committed copy */
+      }
+    }
+    log("FILLLOG-KEEPER", `commit for epoch ${epoch} did not land within poll window`);
+    return false;
+  }
+
+  /** settle_from_log on L1: read the committed FillLog, write Positions. Drains
+   *  all NEW fills (sequence > cursor) in windows of MAX_FILLS_PER_TX. */
+  async function settle(): Promise<void> {
+    const [fillLog] = findFillLogPda(marketIndex, epoch, programId);
+    const l1 = await base.getAccountInfo(fillLog);
+    if (!l1) return;
+
+    let header;
+    try {
+      header = decodeFillLogHeader(l1.data as Buffer);
+    } catch {
+      return;
+    }
+    if (header.count === 0) return;
+    const fills = decodeFillLogFills(l1.data as Buffer);
+
+    // `Market.last_settled_sequence` is the ONLY authority on what has settled.
+    // Reading it once at startup and thereafter trusting the WINDOW maximum is
+    // what let a partial settle skip the unsettled remainder forever while the
+    // keeper logged "settled N fills" and indexed them as settled.
+    let cursor = await readMarketCursor();
+
+    let progressed = true;
+    while (progressed) {
+      progressed = false;
+
+      // Mirror settle_from_log's OWN stop rules, so the window submitted is
+      // exactly the set it will consume. `decodeFillLogFills` walks the ring in
+      // the same `(head + i) % capacity` order the program does, so the two
+      // walks see the same sequence.
+      //
+      // Rule (a): the CONTIGUOUS run from cursor + 1. The program breaks at the
+      // first gap (R4's S4-01 fix) and writes only the prefix maximum.
+      const windowFills: typeof fills = [];
+      let next = cursor + 1n;
+      for (const f of fills) {
+        if (f.sequence < next) continue; // already settled
+        if (f.sequence !== next) {
+          if (REQUIRE_CONTIGUOUS) break; // gap — the program stops here too
+          next = f.sequence; // FILL_LOG_REQUIRE_CONTIGUOUS=0: step over the hole
+        }
+        windowFills.push(f);
+        next += 1n;
+        if (windowFills.length >= MAX_FILLS_PER_TX) break;
+      }
+      if (windowFills.length === 0) return;
+
+      // Rule (b): the program also breaks at the first fill any of whose four
+      // L1 accounts is absent, and 75% of live fills have no L1 Position
+      // (s4.md), so a partial settle is the EXPECTED case. Drop the tail from
+      // the first such fill rather than submitting a window that cannot settle.
+      const pdasFor = (f: (typeof fills)[number]) =>
+        [new PublicKey(f.maker), new PublicKey(f.taker)].flatMap((owner) => [
+          findUserAccountPda(owner, programId)[0],
+          findPositionPda(owner, MARKET_INDEX, programId)[0],
+        ]);
+      const probe = new Map<string, PublicKey>();
+      for (const f of windowFills) for (const pk of pdasFor(f)) probe.set(pk.toBase58(), pk);
+      const probeKeys = Array.from(probe.values());
+      const live = new Set<string>();
+      // MAX_FILLS_PER_TX is 8, so this is at most 32 keys — one batched call.
+      const infos = await base.getMultipleAccountsInfo(probeKeys);
+      infos.forEach((info, i) => {
+        if (info && info.owner.equals(programId) && info.data.length > 0) {
+          live.add(probeKeys[i].toBase58());
+        }
+      });
+      const firstOrphan = windowFills.findIndex(
+        (f) => !pdasFor(f).every((pk) => live.has(pk.toBase58()))
+      );
+      if (firstOrphan >= 0) windowFills.length = firstOrphan;
+      if (windowFills.length === 0) {
+        // The queue is blocked on an orphan fill. R4 made this a liveness
+        // problem with an operator fix (supply the accounts or rotate the
+        // epoch) rather than unauthenticated destruction of settled trades.
+        // Say so instead of bumping pending_fills for a window that cannot
+        // settle and then silently skipping past it.
+        log(
+          "FILLLOG-KEEPER",
+          `epoch ${epoch}: seq ${cursor + 1n} has no L1 UserAccount/Position — queue blocked, not skipped`
+        );
+        return;
+      }
+
+      // Rule (c): the window is sized by FILL COUNT, but the TRANSACTION is
+      // sized by DISTINCT COUNTERPARTIES — settlement carries each owner's
+      // UserAccount AND Position, so 15 owners is 30 remaining accounts and
+      // 1291 serialized bytes against a 1232-byte limit. web3.js throws at
+      // serialize() time, locally, so nothing reaches an RPC, the cursor never
+      // advances, and the next tick rebuilds byte-for-byte the same oversized
+      // window from the same cursor: settlement stalls permanently, not just
+      // for this tick. Truncate to a contiguous prefix of at most
+      // MAX_SETTLE_REMAINING_ACCOUNTS / 2 owners and pick up the remainder next
+      // tick, exactly like the orphan truncation above.
+      //
+      // This can never truncate to an empty window: each fill contributes at
+      // most 2 owners, so the running count first exceeds 14 at index >= 7 —
+      // seven fills are always kept. (MAX_FILLS_PER_TX is 8, so in practice
+      // this only ever drops the last fill of a very wide window.)
+      const ownerCap = MAX_SETTLE_REMAINING_ACCOUNTS / 2;
+      const seenOwners = new Set<string>();
+      for (let i = 0; i < windowFills.length; i++) {
+        const f = windowFills[i];
+        seenOwners.add(new PublicKey(f.maker).toBase58());
+        seenOwners.add(new PublicKey(f.taker).toBase58());
+        if (seenOwners.size > ownerCap) {
+          log(
+            "FILLLOG-KEEPER",
+            `epoch ${epoch}: window spans >${ownerCap} owners — truncating ${windowFills.length} fills to ${i}`
+          );
+          windowFills.length = i;
+          break;
+        }
+      }
+
+      const userSet = new Map<string, PublicKey>();
+      const posSet = new Map<string, PublicKey>();
+      for (const f of windowFills) {
+        for (const owner of [new PublicKey(f.maker), new PublicKey(f.taker)]) {
+          const [u] = findUserAccountPda(owner, programId);
+          userSet.set(u.toBase58(), u);
+          const [p] = findPositionPda(owner, MARKET_INDEX, programId);
+          posSet.set(p.toBase58(), p);
+        }
+      }
+      const users = Array.from(userSet.values());
+      // record_pending_fill bumps once per listed account; settle_from_log
+      // decrements once per (fill, side). Listing the deduplicated set here is
+      // what left 13 live accounts permanently stuck behind the withdrawal gate
+      // (S4-04), so list one entry per (fill, side) instead — duplicates are
+      // intentional and cost one byte each in the compiled message. The
+      // remaining-account set below stays deduplicated; settlement resolves it
+      // by key.
+      //
+      // The bump is symmetric ONLY because `windowFills` is now the truncated,
+      // will-actually-settle set. Bumping a whole window against a settlement
+      // that stops at the first gap or orphan left 2 x (window - settled)
+      // outstanding, and re-bumped the same fills on every retry.
+      const bumps = windowFills.flatMap((f) =>
+        [new PublicKey(f.maker), new PublicKey(f.taker)].map(
+          (owner) => findUserAccountPda(owner, programId)[0]
+        )
+      );
+      const remaining = [
+        ...users.map((pk) => ({ pubkey: pk, isSigner: false, isWritable: true })),
+        ...Array.from(posSet.values()).map((pk) => ({
+          pubkey: pk,
+          isSigner: false,
+          isWritable: true,
+        })),
+      ];
+
+      const tx = new Transaction()
+        .add(createRecordPendingFillInstruction(bumps, keeper.publicKey, programId))
+        .add(
+          createSettleFromLogInstruction(
+            marketIndex,
+            epoch,
+            windowFills.length,
+            remaining,
+            programId
+          )
+        );
+
+      try {
+        const sig = await sendAndConfirm(base, tx, [keeper]);
+        // What settled is what the CHAIN cursor says settled, never the window
+        // maximum. settle_from_log also returns (settled_count, cursor) now; the
+        // cursor read here is one RPC either way and needs no getTransaction.
+        const after = await readMarketCursor();
+        const settledFills = windowFills.filter((f) => f.sequence <= after);
+        log(
+          "FILLLOG-KEEPER",
+          `epoch ${epoch}: settled ${settledFills.length}/${windowFills.length} fills ` +
+            `(cursor ${cursor} -> ${after}) ${sig}`
+        );
+        lastSettledSeq = after;
+        if (after <= cursor) return; // no forward progress — do not spin
+        cursor = after;
+        progressed = true;
+        // Index only what actually settled (best-effort; never breaks settlement).
+        recordSettledFills(
+          settledFills.map((f) => ({
+            sequence: f.sequence,
+            marketIndex: MARKET_INDEX,
+            price: f.price,
+            quantity: f.quantity,
+            maker: new PublicKey(f.maker).toBase58(),
+            taker: new PublicKey(f.taker).toBase58(),
+            makerSide: f.makerSide,
+            filledMargin: f.filledMargin,
+            takerFeeBps: f.takerFeeBpsSnapshot,
+            makerRebateBps: f.makerRebateBpsSnapshot,
+          }))
+        );
+      } catch (e: any) {
+        const c = classifyTxError(e);
+        if (c.code === ERR_FILL_QUEUE_EMPTY) {
+          // The tx reverted, so the bump rolled back with it. Re-read rather
+          // than assuming the window settled.
+          lastSettledSeq = await readMarketCursor();
+          return;
+        }
+        log("FILLLOG-KEEPER", `settle_from_log error: ${c.name ?? c.raw}`);
+        return;
+      }
+    }
+  }
+
+  // A stuck epoch (full FillLog whose commit budget is spent) fails mirror
+  // forever, and tick() returning early meant the rotate path in commit()
+  // could never run — the exact live deadlock this replaces. Rotate directly
+  // after repeated mirror failures instead.
+  let mirrorErrors = 0;
+
+  async function tick(): Promise<void> {
+    const mirrored = await mirror();
+    if (mirrored === "error") {
+      mirrorErrors += 1;
+      if (mirrorErrors >= MIRROR_ERRORS_BEFORE_ROTATE) {
+        log(
+          "FILLLOG-KEEPER",
+          `mirror failed ${mirrorErrors}x on epoch ${epoch}; rotating to a fresh epoch`
+        );
+        mirrorErrors = 0;
+        await rotate();
+      }
+    } else {
+      mirrorErrors = 0;
+      if (mirrored === "mirrored") await commit();
+    }
+    // Always attempt to drain whatever is already committed on L1, independent
+    // of what mirror/commit did this tick: settle_from_log is exactly-once via
+    // Market.last_settled_sequence (safe to call with nothing to do), and
+    // gating it behind a fresh mirror+commit success left already-committed
+    // fills stranded whenever either step merely had nothing new to report.
+    await settle();
+  }
+
+  // Startup needs ER reads (discoverEpoch) and base-RPC writes (init/delegate).
+  // Retry with backoff instead of crashing: the old exit(1)-into-pm2-restart
+  // loop burned RPC quota on every relaunch (33k restarts observed).
+  //
+  // S7-02: discoverEpoch is an unbounded for(;;) of ER getAccountInfo calls and
+  // used to run ABOVE this guard, so an ER outage at boot crashed straight into
+  // main().catch(exit(1)) - the exact path the guard was written to replace.
+  // Everything that touches the network at boot now lives inside it.
+  for (;;) {
+    try {
+      epoch = await discoverEpoch(epoch);
+      await ensureEpochReady(epoch);
+      break;
+    } catch (e: any) {
+      log("FILLLOG-KEEPER", `startup not ready: ${errText(e)}; retrying in 30s`);
+      await sleep(30_000);
+    }
+  }
+  // Seed the local settle cursor from chain so restart doesn't re-send settle
+  // windows for fills the program will just report as already settled.
+  try {
+    lastSettledSeq = await readMarketCursor();
+    // Seed the rotation baseline from the SAME read, so a restart into an
+    // already-wedged market refuses its first rotation instead of paying for one
+    // more epoch to rediscover what the previous 461 established.
+    rotationBaselineCursor = lastSettledSeq;
+    log("FILLLOG-KEEPER", `L1 settlement cursor: ${lastSettledSeq}`);
+  } catch {
+    /* base may be unreachable at boot; settle() copes with a null cursor */
+  }
+  log("FILLLOG-KEEPER", `ready on epoch ${epoch}; entering loop`);
+
+  let consecutiveErrors = 0;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    try {
+      await tick();
+      consecutiveErrors = 0;
+      beat("fill-log", true);
+    } catch (e: any) {
+      consecutiveErrors += 1;
+      log("FILLLOG-KEEPER", `tick error (${consecutiveErrors}): ${errText(e)}`);
+      beat("fill-log", false, errText(e));
+      if (consecutiveErrors > 10) {
+        log("FILLLOG-KEEPER", "too many consecutive errors, backing off 60s");
+        await sleep(60_000);
+        consecutiveErrors = 0;
+      }
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+}
+
+main().catch((err) => {
+  log("FILLLOG-KEEPER", `crashed: ${errText(err)}`);
+  process.exit(1);
+});

@@ -1,0 +1,34 @@
+target/
+node_modules/
+dist/
+.next/
+.env
+.env.*
+!.env.example
+.env.local
+*.so
+*.log
+.test-keys/
+.DS_Store
+*.swp
+*.swo
+
+# Deployment secrets — NEVER commit signing keys
+secrets/
+*keypair*.json
+*-id.json
+id.json
+
+# Fills indexer SQLite DB (keepers/src/shared/fill-db.ts)
+keepers/data/
+
+# Impeccable tool state (live-mode session tokens, generated design snapshot)
+.impeccable/
+
+# Playwright MCP screenshots/snapshots
+.playwright-mcp/
+
+# Architect run artifacts (local only; frozen checks under docs/checks/ stay tracked)
+docs/runs/
+docs/jobs/
+.architect/
